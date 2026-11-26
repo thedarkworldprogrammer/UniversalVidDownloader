@@ -8,7 +8,8 @@ import type {
   HealthResponse,
 } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
+const rawApiBase = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
+export const API_BASE_URL = rawApiBase ? `${rawApiBase}/api` : '/api';
 
 class ApiClient {
   private client: AxiosInstance;

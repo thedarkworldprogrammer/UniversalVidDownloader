@@ -16,6 +16,7 @@ import {
 import { useVideoStore } from '../store';
 import {
   api,
+  API_BASE_URL,
   formatFileSize,
   formatDuration,
   getFormatTypeLabel,
@@ -178,7 +179,7 @@ export function Hero() {
   const buildStreamUrl = (fmt: VideoFormat) => {
     const targetUrl = currentVideo?.url || url.trim();
     if (!targetUrl) return null;
-    return `/api/video/stream?url=${encodeURIComponent(
+    return `${API_BASE_URL}/video/stream?url=${encodeURIComponent(
       targetUrl
     )}&formatId=${encodeURIComponent(fmt.formatId)}`;
   };
@@ -247,7 +248,7 @@ export function Hero() {
     const targetUrl = currentVideo.url || url.trim();
     const title = currentVideo.title || 'video';
 
-    const nativeDownloadUrl = `/api/video/stream?url=${encodeURIComponent(
+    const nativeDownloadUrl = `${API_BASE_URL}/video/stream?url=${encodeURIComponent(
       targetUrl
     )}&formatId=${encodeURIComponent(selectedFormat.formatId)}&title=${encodeURIComponent(
       title

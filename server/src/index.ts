@@ -4,11 +4,20 @@ import { initializeProviders } from './providers';
 import videoRoutes from './routes/video';
 import { errorHandler } from './middleware';
 import { startCleanupJob } from './jobs/cleanup';
+import cors from 'cors';
 
 /**
  * Main application entry point
  */
 const app = express();
+
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    exposedHeaders: ['Content-Disposition'],
+  })
+);
 
 // Start cleanup job
 startCleanupJob();
@@ -43,11 +52,11 @@ function startServer(): void {
   app.listen(config.port, host, () => {
     console.log(`
 ╔══════════════════════════════════════════════════════════════════╗
-║  Universal Video Downloader Server                              ║
+║  Universal Video Downloader Server                               ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Server running on http://${host}:${config.port}                          ║
-║  Environment: ${config.nodeEnv}                                       ║
-║  API Base: http://${host}:${config.port}/api                                      ║
+║  Server running on http://${host}:${config.port}                           ║
+║  Environment: ${config.nodeEnv}                                        ║
+║  API Base: http://${host}:${config.port}/api                               ║
 ╚══════════════════════════════════════════════════════════════════╝
     `);
   });
