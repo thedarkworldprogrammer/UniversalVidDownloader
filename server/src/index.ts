@@ -11,20 +11,20 @@ import cors from 'cors';
  */
 const app = express();
 
-app.use(
-  cors({
-    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
-    methods: ['GET', 'POST', 'OPTIONS'],
-    exposedHeaders: ['Content-Disposition'],
-  })
-);
-// app.use(cors({
-//   origin: [
-//     "https://thedarkworld.in",
-//     "https://www.thedarkworld.in"
-//   ],
-//   methods: ["GET", "POST"],
-// }));
+// app.use(
+//   cors({
+//     origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
+//     methods: ['GET', 'POST', 'OPTIONS'],
+//     exposedHeaders: ['Content-Disposition'],
+//   })
+// );
+app.use(cors({
+  origin: [
+    "https://thedarkworld.in",
+    "https://www.thedarkworld.in"
+  ],
+  methods: ["GET", "POST"],
+}));
 
 // Start cleanup job
 startCleanupJob();
