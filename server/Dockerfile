@@ -13,7 +13,7 @@ RUN npm ci
 COPY . .
 
 # Build TypeScript
-RUN npm run build
+RUN chmod -R +x node_modules/.bin && npm run build
 
 # Production stage
 FROM node:22-alpine AS production

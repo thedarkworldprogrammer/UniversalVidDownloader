@@ -18,6 +18,13 @@ app.use(
     exposedHeaders: ['Content-Disposition'],
   })
 );
+// app.use(cors({
+//   origin: [
+//     "https://thedarkworld.in",
+//     "https://www.thedarkworld.in"
+//   ],
+//   methods: ["GET", "POST"],
+// }));
 
 // Start cleanup job
 startCleanupJob();
