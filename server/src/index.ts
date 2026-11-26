@@ -18,13 +18,38 @@ const app = express();
 //     exposedHeaders: ['Content-Disposition'],
 //   })
 // );
-app.use(cors({
-  origin: [
-    "https://thedarkworld.in",
-    "https://www.thedarkworld.in"
-  ],
-  methods: ["GET", "POST"],
-}));
+// app.use(cors({
+//   origin: [
+//     "https://thedarkworld.in",
+//     "https://www.thedarkworld.in"
+//   ],
+//   methods: ["GET", "POST"],
+// }));
+
+const allowedOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((o) => o.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (curl, direct browser <a download>, <video src>)
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.length === 0 || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, true); // Ya specific domains ke liye allowedOrigins.includes(origin)
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    exposedHeaders: ['Content-Disposition'],
+    credentials: true,
+  })
+);
+
+// Explicit preflight handler for all routes
+app.options('*', cors());
 
 // Start cleanup job
 startCleanupJob();
