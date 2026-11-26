@@ -10,12 +10,10 @@ import { config } from '../config';
 export class YtDlpProvider extends BaseProvider implements IProvider {
   readonly id = 'ytdlp';
   readonly name = 'yt-dlp Universal Extractor';
-  readonly version = '1.0.0';
+  readonly version = '1.1.0';
   readonly status: 'active' | 'deprecated' | 'broken' | 'maintenance' = 'active';
 
-  // yt-dlp supports a vast number of domains - we list major categories
   readonly supportedDomains = [
-    // Major video platforms
     'youtube.com',
     'youtu.be',
     'vimeo.com',
@@ -37,14 +35,13 @@ export class YtDlpProvider extends BaseProvider implements IProvider {
     'rumble.com',
     'odysee.com',
     'peertube',
-    // Many more supported through yt-dlp's generic extractor
   ];
 
   readonly capabilities: ProviderCapabilities = {
     video: true,
     audio: true,
     live: true,
-    playlists: true,
+    playlists: false,
     subtitles: true,
     dash: true,
     hls: true,
@@ -55,14 +52,9 @@ export class YtDlpProvider extends BaseProvider implements IProvider {
   canHandle(url: string): boolean {
     try {
       const domain = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
-
-      // Check direct domain match
       if (this.supportedDomains.some((d) => domain === d || domain.endsWith(`.${d}`))) {
         return true;
       }
-
-      // yt-dlp has a generic extractor that works for many sites
-      // We allow it to try for any valid HTTP/HTTPS URL
       return url.startsWith('http://') || url.startsWith('https://');
     } catch {
       return false;
@@ -72,7 +64,6 @@ export class YtDlpProvider extends BaseProvider implements IProvider {
   async analyze(url: string): Promise<ExtractionResult> {
     const metadata = await this.extractMetadata(url);
 
-    // Validate we got usable formats
     const validFormats = metadata.formats.filter((f) => f.downloadable);
     if (validFormats.length === 0) {
       throw new Error('No downloadable formats found for this URL');
@@ -87,20 +78,22 @@ export class YtDlpProvider extends BaseProvider implements IProvider {
   private async extractMetadata(url: string): Promise<VideoMetadata> {
     return new Promise((resolve, reject) => {
       const args = [
-        'yt_dlp',  // module name for -m
+        '-m',
+        'yt_dlp',
         '--no-warnings',
+        '--no-playlist',
         '--skip-download',
-        '--print-json',
-        '--no-check-certificate',
-        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+        '--dump-single-json',
+        '--socket-timeout',
+        '15',
         '--extractor-retries=3',
-        '--extractor-args=youtube:player_client=web',
         url,
       ];
 
-      const proc = spawn('python', ['-m'].concat(args), {
+      const proc = spawn('python', args, {
         timeout: config.requestTimeout,
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
 
       let stdout = '';
@@ -121,12 +114,7 @@ export class YtDlpProvider extends BaseProvider implements IProvider {
         }
 
         try {
-          // yt-dlp outputs JSON lines for each entry
-          const lines = stdout.trim().split('\n').filter((l) => l.trim());
-          const data = lines.map((line) => JSON.parse(line));
-
-          // For single videos, we get one entry; for playlists, multiple
-          const videoData = data[0];
+          const videoData = JSON.parse(stdout.trim());
           if (!videoData) {
             reject(new Error('No video data extracted'));
             return;
@@ -149,36 +137,130 @@ export class YtDlpProvider extends BaseProvider implements IProvider {
     });
   }
 
+  private isBrowserPlayable(ext: string, vcodec?: string, acodec?: string, protocol?: string): boolean {
+    const p = (protocol || '').toLowerCase();
+    if (p.includes('m3u8') || p.includes('dash') || p.includes('f4m')) {
+      return false;
+    }
+    const e = ext.toLowerCase();
+    const vc = (vcodec || '').toLowerCase();
+    const ac = (acodec || '').toLowerCase();
+
+    if (vc.startsWith('hev1') || vc.startsWith('hvc1') || vc.includes('hevc')) {
+      return false;
+    }
+    if (ac && ac !== 'none' && (ac.includes('ac-3') || ac.includes('ec-3') || ac.includes('dts'))) {
+      return false;
+    }
+    return ['mp4', 'webm', 'ogg', 'm4a', 'mp3', 'wav'].includes(e);
+  }
+
   private parseMetadata(data: any, originalUrl: string): VideoMetadata {
     const formats: VideoFormat[] = [];
+    const seenKeys = new Set<string>();
+    const rawFormats: any[] = Array.isArray(data.formats) ? data.formats : [];
 
-    // Parse formats from yt-dlp output
-    if (data.formats && Array.isArray(data.formats)) {
-      for (const fmt of data.formats) {
-        const normalized = this.normalizeFormat(fmt);
-        if (normalized.downloadable) {
-          formats.push(normalized);
-        }
+    // Locate best audio-only stream so high-res video-only streams can be paired with audio
+    const audioOnlyStreams = rawFormats
+      .filter((f) => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
+      .sort((a, b) => (b.abr || 0) - (a.abr || 0));
+    const bestAudio = audioOnlyStreams[0];
+
+    for (const fmt of rawFormats) {
+      if (!fmt.format_id || fmt.ext === 'mhtml' || fmt.protocol === 'mhtml') continue;
+
+      const normalized = this.normalizeFormat(fmt);
+      if (!normalized.downloadable) continue;
+
+      const ext = (fmt.ext || normalized.ext || 'mp4').toLowerCase();
+      const heightLabel = fmt.height ? `${fmt.height}p` : normalized.resolution || 'Unknown';
+      const fps = fmt.fps ? Math.round(fmt.fps) : undefined;
+
+      // 1. Progressive formats (already contain both video + audio)
+      if (normalized.hasVideo && normalized.hasAudio) {
+        const key = `prog-${ext}-${heightLabel}-${fps || 0}`;
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+
+        const playable = Boolean(fmt.url) && this.isBrowserPlayable(ext, fmt.vcodec, fmt.acodec, fmt.protocol);
+        formats.push({
+          ...normalized,
+          ext,
+          resolution: heightLabel,
+          fps,
+          playable,
+          playbackUrl: playable ? fmt.url : undefined,
+        });
+      }
+
+      // 2. High-resolution video-only streams -> pair with bestAudio for FFmpeg muxing
+      if (normalized.hasVideo && !normalized.hasAudio && bestAudio && (fmt.height || 0) >= 360) {
+        const targetExt = ext === 'webm' && bestAudio.ext === 'webm' ? 'webm' : 'mp4';
+        const key = `muxed-${targetExt}-${heightLabel}-${fps || 0}`;
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+
+        const videoSize = fmt.filesize || fmt.filesize_approx || 0;
+        const audioSize = bestAudio.filesize || bestAudio.filesize_approx || 0;
+
+        formats.push({
+          ...normalized,
+          formatId: `${fmt.format_id}+${bestAudio.format_id}`,
+          ext: targetExt,
+          resolution: heightLabel,
+          fps,
+          hasVideo: true,
+          hasAudio: true,
+          isCombined: false,
+          acodec: bestAudio.acodec,
+          filesize: videoSize && audioSize ? videoSize + audioSize : videoSize || undefined,
+          playable: false, // Requires server-side FFmpeg muxing before playback/download
+          downloadable: true,
+        });
       }
     }
 
-    // Also include the requested format if it's not in formats array
-    if (data.format_id && !formats.some((f) => f.formatId === data.format_id)) {
-      const normalized = this.normalizeFormat(data);
-      if (normalized.downloadable) {
-        formats.push(normalized);
-      }
+    // 3. Real Audio-Only options (if audio exists in source)
+    if (bestAudio) {
+      const audioExt = (bestAudio.ext || 'm4a').toLowerCase();
+      const audioPlayable =
+        Boolean(bestAudio.url) && this.isBrowserPlayable(audioExt, undefined, bestAudio.acodec, bestAudio.protocol);
+
+      formats.push({
+        formatId: String(bestAudio.format_id),
+        ext: audioExt,
+        resolution: 'Audio Only',
+        mimeType: audioExt === 'webm' ? 'audio/webm' : 'audio/mp4',
+        hasVideo: false,
+        hasAudio: true,
+        isCombined: true,
+        acodec: bestAudio.acodec,
+        filesize: bestAudio.filesize || bestAudio.filesize_approx,
+        playable: audioPlayable,
+        downloadable: true,
+        playbackUrl: audioPlayable ? bestAudio.url : undefined,
+      });
+
+      // FFmpeg MP3 conversion option
+      formats.push({
+        formatId: 'bestaudio[ext=m4a]/bestaudio',
+        ext: 'mp3',
+        resolution: 'Audio Only (MP3)',
+        mimeType: 'audio/mpeg',
+        hasVideo: false,
+        hasAudio: true,
+        isCombined: false,
+        acodec: 'mp3',
+        playable: false,
+        downloadable: true,
+      });
     }
 
-    // Sort formats: video+audio first, then video-only, then audio-only
-    // Within each group, sort by quality (height) descending
+    // Sort: combined video+audio first (highest res to lowest), then audio-only
     formats.sort((a, b) => {
-      const aGroup = a.hasVideo && a.hasAudio ? 0 : a.hasVideo ? 1 : 2;
-      const bGroup = b.hasVideo && b.hasAudio ? 0 : b.hasVideo ? 1 : 2;
-      if (aGroup !== bGroup) return aGroup - bGroup;
-
-      const aHeight = parseInt(a.resolution || '0', 10);
-      const bHeight = parseInt(b.resolution || '0', 10);
+      if (a.hasVideo !== b.hasVideo) return a.hasVideo ? -1 : 1;
+      const aHeight = parseInt(a.resolution || '0', 10) || 0;
+      const bHeight = parseInt(b.resolution || '0', 10) || 0;
       return bHeight - aHeight;
     });
 
@@ -204,19 +286,37 @@ export class YtDlpProvider extends BaseProvider implements IProvider {
     return metadata.formats;
   }
 
-  async getPlaybackSource(metadata: VideoMetadata, formatId: string): Promise<string> {
+  async getPlaybackSource(metadata: VideoMetadata, formatId: string, originalUrl?: string): Promise<string> {
     const format = metadata.formats.find((f) => f.formatId === formatId);
     if (!format) {
       throw new Error('Format not found');
     }
+    if ((format as any).playbackUrl) {
+      return (format as any).playbackUrl;
+    }
+    if (!originalUrl) {
+      throw new Error('Direct browser playback is not available for this format');
+    }
 
-    // For browser playback, we need a direct URL
-    // This would require re-extracting with the specific format
-    // For now, return a placeholder - actual implementation would use yt-dlp -g
-    return new Promise((_resolve, _reject) => {
-      // We need the original URL - this is a simplified version
-      // In production, store the original URL with metadata
-      throw new Error('Playback source requires original URL');
+    return new Promise((resolve, reject) => {
+      const proc = spawn('python', ['-m', 'yt_dlp', '--no-warnings', '-f', formatId, '-g', originalUrl], {
+        timeout: config.requestTimeout,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', (d) => (stdout += d.toString()));
+      proc.stderr.on('data', (d) => (stderr += d.toString()));
+      proc.on('close', (code) => {
+        const directUrl = stdout.trim().split('\n')[0];
+        if (code === 0 && directUrl?.startsWith('http')) {
+          resolve(directUrl);
+        } else {
+          reject(new Error(stderr || 'Unable to resolve direct playback stream'));
+        }
+      });
     });
   }
 
@@ -225,10 +325,7 @@ export class YtDlpProvider extends BaseProvider implements IProvider {
     if (!format) {
       throw new Error('Format not found');
     }
-
-    // This is a placeholder - actual download would use yt-dlp with format selection
-    // and stream to outputPath
-    throw new Error('Direct download not implemented in provider - use job queue');
+    throw new Error('Direct download handled via background job queue');
   }
 
   private extractDomain(url: string): string | null {
@@ -240,5 +337,4 @@ export class YtDlpProvider extends BaseProvider implements IProvider {
   }
 }
 
-// Export singleton
 export const ytdlpProvider = new YtDlpProvider();

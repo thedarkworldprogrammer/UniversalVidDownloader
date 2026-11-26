@@ -22,6 +22,8 @@ export interface VideoFormat {
   vbr?: number;
   language?: string;
   container?: string;
+  isCombined?: boolean;
+  playbackUrl?: string;
 }
 
 export interface VideoMetadata {

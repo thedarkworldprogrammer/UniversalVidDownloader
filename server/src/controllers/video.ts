@@ -1,10 +1,12 @@
 import { Request, Response } from 'express';
 import { providerRegistry } from '../providers';
 import { AnalysisResponse, DownloadResponse, JobStatus } from '../types';
-import { analysisRequestSchema, downloadRequestSchema } from '../validators/url';
+import { analysisRequestSchema, downloadRequestSchema, validateSafePublicUrl } from '../validators/url';
 import { randomUUID } from 'crypto';
 import { JobQueue, getJobStore } from '../jobs/queue';
 import fs from 'fs/promises';
+import { spawn } from 'child_process';
+import { config } from '../config';
 
 /**
  * Video controller - handles analysis and download endpoints
@@ -51,6 +53,7 @@ export async function analyzeVideo(req: Request, res: Response) {
     }
 
     const { url } = validation.data;
+    await validateSafePublicUrl(url);
 
     // Find provider
     const provider = providerRegistry.findProvider(url);
@@ -83,6 +86,10 @@ export async function analyzeVideo(req: Request, res: Response) {
     console.error('Analysis error:', error);
 
     const message = error instanceof Error ? error.message : 'Analysis failed';
+
+    if (error instanceof Error && error.name === 'ValidationError') {
+      return res.status(400).json({ success: false, error: error.message } as AnalysisResponse);
+    }
 
     // Sanitize error message
     let userMessage = 'Failed to analyze video. Please check the URL and try again.';
@@ -122,6 +129,8 @@ export async function downloadVideo(req: Request, res: Response) {
     }
 
     const { url, formatId } = validation.data;
+
+    await validateSafePublicUrl(url);
 
     // Find provider
     const provider = providerRegistry.findProvider(url);
@@ -276,10 +285,43 @@ export async function downloadFile(_req: Request, res: Response) {
       fileStream.on('end', async () => {
         // Clean up temp file after download
         try {
-          await fs.unlink(filePath);
-          getJobs().delete(jobId);
+          const stat = await fs.stat(filePath);
+          const isPreview = _req.query.preview === 'true';
+          const contentType = job.mimeType || 'application/octet-stream';
+
+          res.setHeader('Content-Type', contentType);
+          res.setHeader('Accept-Ranges', 'bytes');
+
+          if (!isPreview) {
+            res.setHeader(
+              'Content-Disposition',
+              `attachment; filename="${encodeURIComponent(job.filename || 'video')}"`
+            );
+          }
+
+          const range = _req.headers.range;
+          if (range) {
+            const parts = range.replace(/bytes=/, '').split('-');
+            const start = parseInt(parts[0], 10);
+            const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+            const chunkSize = end - start + 1;
+
+            res.status(206);
+            res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+            res.setHeader('Content-Length', chunkSize);
+
+            const stream = require('fs').createReadStream(filePath, { start, end });
+            stream.pipe(res);
+          } else {
+            res.setHeader('Content-Length', stat.size);
+            const stream = require('fs').createReadStream(filePath);
+            stream.pipe(res);
+          }
         } catch {
-          // Ignore cleanup errors
+          return res.status(404).json({
+            success: false,
+            error: 'File not found or expired',
+          });
         }
       });
     } catch {
@@ -345,6 +387,320 @@ export async function getProvider(req: Request, res: Response) {
     });
   }
 }
+
+/**
+ * GET /api/video/stream?url=...&formatId=...
+ * Stream video directly (including FFmpeg live muxing for adaptive high-res formats)
+ */
+export async function streamVideo(req: Request, res: Response): Promise<void> {
+  const url = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+  const formatId = typeof req.query.formatId === 'string' ? req.query.formatId.trim() : '';
+  const isDownload = req.query.download === '1' || req.query.download === 'true';
+  const rawTitle = typeof req.query.title === 'string' ? req.query.title.trim() : 'video';
+
+  if (!url) {
+    res.status(400).json({ success: false, error: 'Missing url parameter' });
+    return;
+  }
+
+  const normalizeWinPath = (binPath: string): string => {
+    if (process.platform === 'win32' && /^\/[a-zA-Z]\//.test(binPath)) {
+      return `${binPath[1].toUpperCase()}:${binPath.slice(2)}`;
+    }
+    return binPath;
+  };
+
+  const ytdlpBin = normalizeWinPath(
+    (config as any).ytdlpPath || process.env.YTDLP_PATH || 'yt-dlp'
+  );
+  const ffmpegBin = normalizeWinPath(
+    (config as any).ffmpegPath || process.env.FFMPEG_PATH || 'ffmpeg'
+  );
+
+  const isAudioOnly = formatId.startsWith('mp3') || formatId === 'bestaudio';
+  const ext = isAudioOnly ? 'mp3' : 'mp4';
+
+  // Safe filename for browser native downloader
+  const safeFilename =
+    rawTitle
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 120) || 'video';
+
+  let formatSelector = 'best[ext=mp4]/best';
+  if (isAudioOnly) {
+    formatSelector = 'bestaudio/best';
+  } else if (formatId && formatId !== 'best') {
+    formatSelector = formatId.includes('+')
+      ? formatId
+      : `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}/best`;
+  }
+
+  res.setHeader('Content-Type', isAudioOnly ? 'audio/mpeg' : 'video/mp4');
+  if (isDownload) {
+    const encodedName = encodeURIComponent(`${safeFilename}.${ext}`);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${safeFilename.replace(/[^\x20-\x7E]/g, '_')}.${ext}"; filename*=UTF-8''${encodedName}`
+    );
+  }
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Accept-Ranges', 'none');
+
+  const ytdlpArgs = [
+    '--no-playlist',
+    '--no-warnings',
+    '--no-part',
+    '-f',
+    formatSelector,
+    ...(isAudioOnly ? [] : ['--merge-output-format', 'mkv']),
+    '-o',
+    '-',
+    url,
+  ];
+
+  const ytdlpProc = spawn(ytdlpBin, ytdlpArgs, { windowsHide: true });
+
+  const ffmpegArgs = isAudioOnly
+    ? [
+      '-loglevel',
+      'error',
+      '-i',
+      'pipe:0',
+      '-vn',
+      '-c:a',
+      'libmp3lame',
+      '-b:a',
+      '192k',
+      '-f',
+      'mp3',
+      'pipe:1',
+    ]
+    : [
+      '-loglevel',
+      'error',
+      '-i',
+      'pipe:0',
+      '-c:v',
+      'copy',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '160k',
+      '-movflags',
+      'frag_keyframe+empty_moov+default_base_moof',
+      '-f',
+      'mp4',
+      'pipe:1',
+    ];
+
+  const ffmpegProc = spawn(ffmpegBin, ffmpegArgs, { windowsHide: true });
+
+  ytdlpProc.stdout.pipe(ffmpegProc.stdin);
+  ffmpegProc.stdout.pipe(res);
+
+  ytdlpProc.stderr.on('data', (chunk) => {
+    const msg = chunk.toString().trim();
+    if (msg) console.error('[yt-dlp stream]', msg);
+  });
+
+  ffmpegProc.stderr.on('data', (chunk) => {
+    const msg = chunk.toString().trim();
+    if (msg) console.error('[ffmpeg stream]', msg);
+  });
+
+  ffmpegProc.stdin.on('error', () => { });
+  ytdlpProc.stdout.on('error', () => { });
+
+  const cleanup = () => {
+    try {
+      if (!ytdlpProc.killed) ytdlpProc.kill('SIGKILL');
+    } catch { }
+    try {
+      if (!ffmpegProc.killed) ffmpegProc.kill('SIGKILL');
+    } catch { }
+  };
+
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+
+  ytdlpProc.on('error', (err) => {
+    console.error('yt-dlp stream spawn error:', err);
+    cleanup();
+    if (!res.headersSent) res.status(500).end();
+  });
+
+  ffmpegProc.on('error', (err) => {
+    console.error('ffmpeg stream spawn error:', err);
+    cleanup();
+    if (!res.headersSent) res.status(500).end();
+  });
+}
+// export async function streamVideo(req: Request, res: Response): Promise<void> {
+//   const url = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+//   const formatId = typeof req.query.formatId === 'string' ? req.query.formatId.trim() : '';
+//   const isDownload = req.query.download === '1' || req.query.download === 'true';
+//   const rawTitle = typeof req.query.title === 'string' ? req.query.title.trim() : 'video';
+
+//   if (!url) {
+//     res.status(400).json({ success: false, error: 'Missing url parameter' });
+//     return;
+//   }
+
+//   const normalizeWinPath = (binPath: string): string => {
+//     if (process.platform === 'win32' && /^\/[a-zA-Z]\//.test(binPath)) {
+//       return `${binPath[1].toUpperCase()}:${binPath.slice(2)}`;
+//     }
+//     return binPath;
+//   };
+
+//   const ytdlpBin = normalizeWinPath(
+//     (config as any).ytdlpPath || process.env.YTDLP_PATH || 'yt-dlp'
+//   );
+//   const ffmpegBin = normalizeWinPath(
+//     (config as any).ffmpegPath || process.env.FFMPEG_PATH || 'ffmpeg'
+//   );
+
+//   const isAudioOnly = formatId.startsWith('mp3') || formatId === 'bestaudio';
+//   const ext = isAudioOnly ? 'mp3' : 'mp4';
+
+//   const safeFilename =
+//     rawTitle
+//       .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+//       .replace(/\s+/g, ' ')
+//       .trim()
+//       .slice(0, 120) || 'video';
+
+//   // Prefer M4A (native AAC) for audio so FFmpeg can copy audio without slow re-encoding
+//   let formatSelector = 'best[ext=mp4]/best';
+//   if (isAudioOnly) {
+//     formatSelector = 'bestaudio[ext=m4a]/bestaudio/best';
+//   } else if (formatId && formatId !== 'best') {
+//     formatSelector = formatId.includes('+')
+//       ? formatId
+//       : `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}/best`;
+//   }
+
+//   res.setHeader('Content-Type', isAudioOnly ? 'audio/mpeg' : 'video/mp4');
+//   if (isDownload) {
+//     const encodedName = encodeURIComponent(`${safeFilename}.${ext}`);
+//     res.setHeader(
+//       'Content-Disposition',
+//       `attachment; filename="${safeFilename.replace(/[^\x20-\x7E]/g, '_')}.${ext}"; filename*=UTF-8''${encodedName}`
+//     );
+//   }
+//   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+
+//   // High-speed parallel fragment & chunked HTTP arguments for yt-dlp
+//   const ytdlpArgs = [
+//     '--no-playlist',
+//     '--no-warnings',
+//     '--no-part',
+//     '--concurrent-fragments',
+//     '12',
+//     '--http-chunk-size',
+//     '10M',
+//     '--buffer-size',
+//     '1M',
+//     '--retries',
+//     '3',
+//     '--fragment-retries',
+//     '3',
+//     '-f',
+//     formatSelector,
+//     ...(isAudioOnly ? [] : ['--merge-output-format', 'mkv']),
+//     '-o',
+//     '-',
+//     url,
+//   ];
+
+//   const ytdlpProc = spawn(ytdlpBin, ytdlpArgs, {
+//     windowsHide: true,
+//     stdio: ['ignore', 'pipe', 'pipe'],
+//   });
+
+//   // Zero-reencode stream copy when possible for maximum throughput
+//   const ffmpegArgs = isAudioOnly
+//     ? [
+//       '-loglevel',
+//       'error',
+//       '-i',
+//       'pipe:0',
+//       '-vn',
+//       '-c:a',
+//       'libmp3lame',
+//       '-q:a',
+//       '2',
+//       '-f',
+//       'mp3',
+//       'pipe:1',
+//     ]
+//     : [
+//       '-loglevel',
+//       'error',
+//       '-thread_queue_size',
+//       '1024',
+//       '-i',
+//       'pipe:0',
+//       '-c:v',
+//       'copy',
+//       '-c:a',
+//       'aac',
+//       '-b:a',
+//       '128k',
+//       '-movflags',
+//       'frag_keyframe+empty_moov+default_base_moof',
+//       '-f',
+//       'mp4',
+//       'pipe:1',
+//     ];
+
+//   const ffmpegProc = spawn(ffmpegBin, ffmpegArgs, {
+//     windowsHide: true,
+//     stdio: ['pipe', 'pipe', 'pipe'],
+//   });
+
+//   ytdlpProc.stdout.pipe(ffmpegProc.stdin);
+//   ffmpegProc.stdout.pipe(res);
+
+//   ytdlpProc.stderr.on('data', (chunk) => {
+//     const msg = chunk.toString().trim();
+//     if (msg && msg.includes('ERROR:')) console.error('[yt-dlp stream]', msg);
+//   });
+
+//   ffmpegProc.stderr.on('data', (chunk) => {
+//     const msg = chunk.toString().trim();
+//     if (msg) console.error('[ffmpeg stream]', msg);
+//   });
+
+//   ffmpegProc.stdin.on('error', () => { });
+//   ytdlpProc.stdout.on('error', () => { });
+
+//   const cleanup = () => {
+//     try {
+//       if (!ytdlpProc.killed) ytdlpProc.kill('SIGKILL');
+//     } catch { }
+//     try {
+//       if (!ffmpegProc.killed) ffmpegProc.kill('SIGKILL');
+//     } catch { }
+//   };
+
+//   req.on('close', cleanup);
+//   res.on('close', cleanup);
+
+//   ytdlpProc.on('error', (err) => {
+//     console.error('yt-dlp stream spawn error:', err);
+//     cleanup();
+//     if (!res.headersSent) res.status(500).end();
+//   });
+
+//   ffmpegProc.on('error', (err) => {
+//     console.error('ffmpeg stream spawn error:', err);
+//     cleanup();
+//     if (!res.headersSent) res.status(500).end();
+//   });
+// }
 
 /**
  * GET /api/health

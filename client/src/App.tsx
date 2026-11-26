@@ -6,14 +6,19 @@ import { SettingsPage } from './pages/SettingsPage';
 
 function App() {
   return (
-    <BrowserRouter>
-      <MainLayout>
-        <Routes>
+    <BrowserRouter
+      future={{
+        v7_startTransition: true,
+        v7_relativeSplatPath: true,
+      }}
+    >
+      <Routes>
+        <Route element={<MainLayout />}>
           <Route path="/" element={<HomePage />} />
           <Route path="/download/:jobId" element={<DownloadPage />} />
           <Route path="/settings" element={<SettingsPage />} />
-        </Routes>
-      </MainLayout>
+        </Route>
+      </Routes>
     </BrowserRouter>
   );
 }

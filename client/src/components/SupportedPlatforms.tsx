@@ -28,25 +28,39 @@ const categories = [
 ];
 
 export function SupportedPlatforms() {
-  const { providers, setProviders, isLoadingProviders } = useVideoStore();
+  const store = useVideoStore() as any;
+  const [localProviders, setLocalProviders] = useState<any[]>([]);
   const [showAll, setShowAll] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [isLoadingProviders, setIsLoadingProviders] = useState(false);
+
+  const providers =
+    Array.isArray(store.providers) && store.providers.length > 0
+      ? store.providers
+      : localProviders;
 
   useEffect(() => {
     setMounted(true);
-    if (!providers.length) {
-      loadProviders();
-    }
+    loadProviders();
   }, []);
 
   const loadProviders = async () => {
+    setIsLoadingProviders(true);
     try {
       const response = await api.getProviders();
       if (response.success && response.data) {
-        setProviders(response.data.providers || []);
+        const list = Array.isArray(response.data)
+          ? response.data
+          : (response.data as any).providers || [];
+        setLocalProviders(list);
+        if (typeof store.setProviders === 'function') {
+          store.setProviders(list);
+        }
       }
     } catch (error) {
       console.error('Failed to load providers:', error);
+    } finally {
+      setIsLoadingProviders(false);
     }
   };
 
@@ -155,7 +169,7 @@ export function SupportedPlatforms() {
               <div className="flex justify-center py-8">
                 <Loader2 className="w-8 h-8 animate-spin text-primary-500" aria-hidden="true" />
               </div>
-            ) : providers.length > 0 ? (
+            ) : Array.isArray(providers) && providers.length > 0 ? (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 {providers.map((provider) => (
                   <div

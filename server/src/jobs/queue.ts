@@ -5,39 +5,34 @@ import { JobData, VideoFormat } from '../types';
 import fs from 'fs/promises';
 import path from 'path';
 import { spawn } from 'child_process';
+// @ts-ignore
 import ffmpeg from 'fluent-ffmpeg';
 
-// Configure FFmpeg paths
 ffmpeg.setFfmpegPath(config.ffmpegPath);
 ffmpeg.setFfprobePath(config.ffprobePath);
 
-// In-memory job store (shared with controller)
 const jobStore = new Map<string, any>();
 
 export function getJobStore() {
   return jobStore;
 }
 
-// Job queue for downloads
 const downloadQueue = new Queue('downloads', {
   connection: {
     host: new URL(config.redisUrl).hostname,
     port: parseInt(new URL(config.redisUrl).port || '6379', 10),
   },
   defaultJobOptions: {
-    attempts: 3,
+    attempts: 2,
     backoff: {
       type: 'exponential',
-      delay: 5000,
+      delay: 3000,
     },
     removeOnComplete: 100,
     removeOnFail: 50,
   },
 });
 
-/**
- * Job queue manager
- */
 export class JobQueue {
   async addDownloadJob(data: JobData): Promise<string> {
     const job = await downloadQueue.add('download', data);
@@ -68,16 +63,12 @@ export class JobQueue {
   }
 }
 
-/**
- * Download worker - processes download jobs
- */
 const downloadWorker = new Worker(
   'downloads',
   async (job: Job<JobData>) => {
     const { jobId, url, formatId, providerId, format } = job.data;
 
     try {
-      // Update job status
       updateJobStatus(jobId, 'processing', 10, 'Starting download...');
 
       const provider = providerRegistry.get(providerId);
@@ -85,75 +76,75 @@ const downloadWorker = new Worker(
         throw new Error('Provider not found');
       }
 
-      // Re-analyze to get fresh metadata
       updateJobStatus(jobId, 'processing', 20, 'Retrieving video information...');
       const result = await provider.analyze(url);
       const metadata = result.metadata;
 
-      // Check if audio-only format requested
       const isAudioOnly = format.hasAudio && !format.hasVideo;
+      const isMp3Conversion = isAudioOnly && format.ext === 'mp3';
 
-      // Generate output filename
       const sanitizedTitle = provider.sanitizeFilename(metadata.title);
-      const ext = format.ext || (isAudioOnly ? 'mp3' : 'mp4');
-      const filename = `${sanitizedTitle}.${ext}`;
-      const outputPath = path.join(config.tempDir, jobId, filename);
+      const targetExt = format.ext || (isAudioOnly ? 'mp3' : 'mp4');
+      const jobDir = path.join(config.tempDir, jobId);
+      await fs.mkdir(jobDir, { recursive: true });
 
-      // Ensure temp directory exists
-      await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      const rawOutputPath = path.join(
+        jobDir,
+        isMp3Conversion ? `${sanitizedTitle}_source.%(ext)s` : `${sanitizedTitle}.${targetExt}`
+      );
 
-      updateJobStatus(jobId, 'processing', 30, isAudioOnly ? 'Downloading video for audio extraction...' : 'Downloading video...');
+      updateJobStatus(
+        jobId,
+        'processing',
+        30,
+        isAudioOnly ? 'Downloading audio stream...' : 'Downloading video...'
+      );
 
-      // Download using yt-dlp
-      // For audio-only, we download the best video+audio format then extract audio
-      const downloadFormatId = isAudioOnly ? 'bestvideo+bestaudio/best' : formatId;
-      await downloadWithYtDlp(url, downloadFormatId, outputPath, jobId);
+      const downloadFormatId = isMp3Conversion ? 'bestaudio[ext=m4a]/bestaudio/best' : formatId;
+      await downloadWithYtDlp(url, downloadFormatId, rawOutputPath, jobId, isAudioOnly ? undefined : targetExt);
 
-      // If audio-only format requested, convert using FFmpeg
-      let finalOutputPath = outputPath;
-      let finalFilename = filename;
+      let finalOutputPath = rawOutputPath;
+      let finalFilename = `${sanitizedTitle}.${targetExt}`;
       let finalSize = 0;
 
-      if (isAudioOnly) {
-        // Convert to audio
-        const audioExt = format.ext || 'mp3';
-        const audioFilename = `${sanitizedTitle}.${audioExt}`;
-        const audioOutputPath = path.join(config.tempDir, jobId, audioFilename);
+      if (isMp3Conversion) {
+        const files = await fs.readdir(jobDir);
+        const sourceFile = files.find((f) => f.startsWith(`${sanitizedTitle}_source`));
+        if (!sourceFile) {
+          throw new Error('Source audio stream not found for MP3 conversion');
+        }
+        const sourcePath = path.join(jobDir, sourceFile);
+        const audioOutputPath = path.join(jobDir, finalFilename);
 
-        await convertToAudio(outputPath, audioOutputPath, format, jobId);
+        await convertToAudio(sourcePath, audioOutputPath, format, jobId);
 
-        // Verify audio file exists
         await fs.access(audioOutputPath);
         const audioStats = await fs.stat(audioOutputPath);
 
-        // Clean up original video file
-        try {
-          await fs.unlink(outputPath);
-        } catch {
-          // Ignore cleanup errors
-        }
+        await fs.unlink(sourcePath).catch(() => {});
 
         finalOutputPath = audioOutputPath;
-        finalFilename = audioFilename;
         finalSize = audioStats.size;
       } else {
-        // Verify file exists
-        await fs.access(outputPath);
-        const stats = await fs.stat(outputPath);
+        await fs.access(rawOutputPath);
+        const stats = await fs.stat(rawOutputPath);
         finalSize = stats.size;
       }
 
       updateJobStatus(jobId, 'processing', 100, 'Completed');
 
-      // Update job with download info
       const finalJob = {
         jobId,
         status: 'completed',
         progress: 100,
         message: 'Download completed',
         downloadUrl: finalOutputPath,
+        outputPath: finalOutputPath,
         filename: finalFilename,
         filesize: finalSize,
+        totalBytes: finalSize,
+        mimeType: format.mimeType || (isAudioOnly ? 'audio/mpeg' : 'video/mp4'),
+        playable: Boolean(format.playable) || ['mp4', 'webm', 'mp3', 'm4a', 'ogg'].includes(targetExt),
         createdAt: jobStore.get(jobId)?.createdAt || new Date(),
         updatedAt: new Date(),
       };
@@ -186,44 +177,43 @@ const downloadWorker = new Worker(
   }
 );
 
-/**
- * Download video using yt-dlp via Python module
- */
 function downloadWithYtDlp(
   url: string,
   formatId: string,
   outputPath: string,
-  jobId: string
+  jobId: string,
+  mergeFormat?: string
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const args = [
+      '-m',
       'yt_dlp',
       '--no-warnings',
+      '--no-playlist',
       '-f',
       formatId,
+      ...(mergeFormat && formatId.includes('+') ? ['--merge-output-format', mergeFormat] : []),
       '-o',
       outputPath,
       '--progress',
       '--newline',
-      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
       '--extractor-retries=3',
-      '--extractor-args=youtube:player_client=web',
       url,
     ];
 
-    const proc = spawn('python', ['-m'].concat(args), {
+    const proc = spawn('python', args, {
       timeout: config.requestTimeout,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     let stderr = '';
 
     proc.stdout.on('data', (data) => {
       const output = data.toString();
-      // Parse progress from yt-dlp output
       const progressMatch = output.match(/\[download\]\s+(\d+(?:\.\d+)?)%/);
       if (progressMatch) {
-        const progress = Math.min(30 + Math.floor(parseFloat(progressMatch[1]) * 0.6), 85);
+        const progress = Math.min(30 + Math.floor(parseFloat(progressMatch[1]) * 0.55), 85);
         updateJobStatus(jobId, 'processing', progress, 'Downloading...');
       }
     });
@@ -250,9 +240,6 @@ function downloadWithYtDlp(
   });
 }
 
-/**
- * Update job status in store
- */
 export function updateJobStatus(
   jobId: string,
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled',
@@ -275,7 +262,6 @@ export function updateJobStatus(
   jobStore.set(jobId, updated);
 }
 
-// Handle worker events
 downloadWorker.on('completed', (job) => {
   console.log(`Download job ${job.id} completed`);
 });
@@ -288,9 +274,6 @@ downloadWorker.on('error', (err) => {
   console.error('Download worker error:', err);
 });
 
-/**
- * Convert video to audio using FFmpeg
- */
 async function convertToAudio(
   inputPath: string,
   outputPath: string,
@@ -299,7 +282,7 @@ async function convertToAudio(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const audioFormat = format.ext === 'm4a' ? 'aac' : 'libmp3lame';
-    const audioBitrate = format.abr || 128;
+    const audioBitrate = format.abr || 192;
 
     ffmpeg(inputPath)
       .audioCodec(audioFormat)
@@ -324,7 +307,4 @@ async function convertToAudio(
   });
 }
 
-/**
- * Download worker - processes download jobs
- */
 export { downloadQueue, downloadWorker };

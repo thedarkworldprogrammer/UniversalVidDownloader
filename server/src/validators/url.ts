@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import dns from 'dns/promises';
+import net from 'net';
 import { config } from '../config';
 
 /**
@@ -17,7 +19,8 @@ export class ValidationError extends Error {
 
 // Analysis request validation
 export const analysisRequestSchema = z.object({
-  url: z.string()
+  url: z
+    .string()
     .min(1, 'URL is required')
     .max(2048, 'URL too long')
     .url('Invalid URL format')
@@ -28,12 +31,17 @@ export type AnalysisRequest = z.infer<typeof analysisRequestSchema>;
 
 // Download request validation
 export const downloadRequestSchema = z.object({
-  url: z.string()
+  url: z
+    .string()
     .min(1, 'URL is required')
     .max(2048, 'URL too long')
     .url('Invalid URL format')
     .refine(isValidUrl, 'Invalid or unsupported URL'),
-  formatId: z.string().min(1, 'Format ID is required'),
+  formatId: z
+    .string()
+    .min(1, 'Format ID is required')
+    .max(64, 'Invalid format ID')
+    .regex(/^[a-zA-Z0-9._+-]+$/, 'Format ID contains invalid characters'),
 });
 
 export type DownloadRequest = z.infer<typeof downloadRequestSchema>;
@@ -50,9 +58,11 @@ const PRIVATE_IP_RANGES = [
   /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
   /^::1$/,
   /^fc00:/i,
+  /^fd[0-9a-f]{2}:/i,
   /^fe80:/i,
   // Reserved/multicast/broadcast ranges
   /^0\./,
+  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, // Carrier-grade NAT
   /^22[4-9]\./,
   /^23[0-9]\./,
   /^24[0-9]\./,
@@ -61,6 +71,15 @@ const PRIVATE_IP_RANGES = [
 ];
 
 const BLOCKED_TLDS = ['local', 'internal', 'corp', 'home', 'lan', 'test', 'localhost'];
+
+export function isPrivateIpAddress(ip: string): boolean {
+  const normalized = ip.replace(/^\[|\]$/g, '').toLowerCase();
+  if (normalized.startsWith('::ffff:')) {
+    const ipv4 = normalized.slice(7);
+    return PRIVATE_IP_RANGES.some((regex) => regex.test(ipv4));
+  }
+  return PRIVATE_IP_RANGES.some((regex) => regex.test(normalized));
+}
 
 export function isValidUrl(url: string): boolean {
   try {
@@ -77,7 +96,7 @@ export function isValidUrl(url: string): boolean {
       hostname === 'localhost' ||
       hostname === '0.0.0.0' ||
       hostname === '[::1]' ||
-      PRIVATE_IP_RANGES.some((regex) => regex.test(hostname))
+      isPrivateIpAddress(hostname)
     ) {
       return false;
     }
@@ -90,14 +109,14 @@ export function isValidUrl(url: string): boolean {
 
     // Reject hostnames that are just a TLD (e.g., ".com", ".org") or empty
     const parts = hostname.split('.');
-    if (parts.length < 2 || parts.some(p => p.length === 0)) {
+    if (parts.length < 2 || parts.some((p) => p.length === 0)) {
       return false;
     }
 
     // Check blocked domains from config
     if (config.blockedDomains.length > 0) {
-      const isBlocked = config.blockedDomains.some((domain) =>
-        hostname === domain || hostname.endsWith(`.${domain}`)
+      const isBlocked = config.blockedDomains.some(
+        (domain) => hostname === domain || hostname.endsWith(`.${domain}`)
       );
       if (isBlocked) {
         return false;
@@ -106,8 +125,8 @@ export function isValidUrl(url: string): boolean {
 
     // If allowed domains are configured, only allow those
     if (config.allowedDomains.length > 0) {
-      const isAllowed = config.allowedDomains.some((domain) =>
-        hostname === domain || hostname.endsWith(`.${domain}`)
+      const isAllowed = config.allowedDomains.some(
+        (domain) => hostname === domain || hostname.endsWith(`.${domain}`)
       );
       if (!isAllowed) {
         return false;
@@ -118,6 +137,41 @@ export function isValidUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Async DNS-rebinding & SSRF guard for outbound requests
+ */
+export async function validateSafePublicUrl(url: string): Promise<URL> {
+  if (!isValidUrl(url)) {
+    throw new ValidationError('Invalid or unsupported URL');
+  }
+
+  const parsed = new URL(url);
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+
+  if (net.isIP(hostname)) {
+    if (isPrivateIpAddress(hostname)) {
+      throw new ValidationError('Private or reserved IP addresses are blocked');
+    }
+    return parsed;
+  }
+
+  const records = await dns.lookup(hostname, { all: true }).catch(() => {
+    throw new ValidationError('Unable to resolve target domain');
+  });
+
+  if (!records || records.length === 0) {
+    throw new ValidationError('Domain has no valid DNS records');
+  }
+
+  for (const record of records) {
+    if (isPrivateIpAddress(record.address)) {
+      throw new ValidationError('Domain resolves to a private or restricted IP address');
+    }
+  }
+
+  return parsed;
 }
 
 /**
