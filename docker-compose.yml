@@ -1,0 +1,95 @@
+version: '3.8'
+
+services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:7-alpine
+    container_name: uvd-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: universal-video-downloader
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-changeme}
+    volumes:
+      - mongodb_data:/data/db
+      - ./server/init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - uvd-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Redis for BullMQ
+  redis:
+    image: redis:7-alpine
+    container_name: uvd-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - uvd-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # Backend Server
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: uvd-server
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      MONGODB_URI: mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASSWORD:-changeme}@mongodb:27017/universal-video-downloader?authSource=admin
+      REDIS_URL: redis://redis:6379
+      TEMP_DIR: /tmp/downloads
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-2}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-30000}
+      BLOCKED_DOMAINS: ${BLOCKED_DOMAINS:-}
+      ALLOWED_DOMAINS: ${ALLOWED_DOMAINS:-}
+    volumes:
+      - downloads_temp:/tmp/downloads
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - uvd-network
+    ports:
+      - "3001:3001"
+
+  # Frontend Client (nginx)
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: uvd-client
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: http://localhost:3001/api
+    depends_on:
+      - server
+    networks:
+      - uvd-network
+    ports:
+      - "80:80"
+      - "443:443"
+
+volumes:
+  mongodb_data:
+  redis_data:
+  downloads_temp:
+
+networks:
+  uvd-network:
+    driver: bridge
